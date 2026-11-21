@@ -122,6 +122,10 @@ impl Tooltip {
         let _ = self.popup.panel.set_tier(tier);
     }
 
+    pub fn is_visible(&self) -> bool {
+        self.popup.is_visible()
+    }
+
     pub fn hide(&self) {
         if self.popup.is_visible() {
             self.popup.hide();

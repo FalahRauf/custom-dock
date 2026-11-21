@@ -1120,6 +1120,7 @@ impl Dock {
         let slot = self.entry_at(x).map(|(i, _)| i);
         if slot != self.hover {
             self.hover = slot;
+            let tip_was_up = self.tooltip.as_ref().is_some_and(|t| t.is_visible());
             if let Some(t) = &self.tooltip {
                 t.hide();
             }
@@ -1133,8 +1134,8 @@ impl Dock {
                         timer(self.hwnd, TIMER_TIP, 250);
                     }
                 } else {
-                    timer(self.hwnd, TIMER_TIP, 250);
-                    timer(self.hwnd, TIMER_PREVIEW, 450);
+                    timer(self.hwnd, TIMER_TIP, if tip_was_up { 120 } else { 650 });
+                    timer(self.hwnd, TIMER_PREVIEW, 1100);
                 }
             }
         }

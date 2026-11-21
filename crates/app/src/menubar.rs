@@ -29,6 +29,7 @@ const WM_NOTCH: u32 = WM_APP + 71;
 const WM_TEST_NET: u32 = WM_APP + 75;
 const T_CLOCK: usize = 1;
 const T_STATUS: usize = 2;
+const T_LIFT: usize = 41;
 const T_APP: usize = 3;
 const T_FS: usize = 4;
 const T_SIG: usize = 5;
@@ -59,6 +60,7 @@ const NATIVE0: u32 = 50;
 const TRAY0: u32 = 200;
 const TRAY_BTN: u32 = 199;
 const STATUS: u32 = 198;
+const VOL: u32 = 197;
 const TRAY_MAX: usize = 16;
 const NATIVE_CMD: usize = 100_000;
 
@@ -100,6 +102,8 @@ struct Bar {
     tray: Vec<crate::tray::Icon>,
     corner: Option<(i32, i32, i32)>,
     flyout: Option<Popup>,
+    fly_out: u32,
+    menu_lift: u32,
     fly_cells: Vec<(f32, f32, f32, usize)>,
 }
 
@@ -394,6 +398,8 @@ fn create(comp: &Compositor) -> windows_core::Result<Box<Bar>> {
         tray: crate::tray::icons(),
         corner: None,
         flyout: None,
+        fly_out: 0,
+        menu_lift: 0,
         fly_cells: vec![],
     });
     bar.apply_bg();
@@ -701,13 +707,23 @@ impl Bar {
 
     fn update_tip(&mut self) {
         let tray_tip = self.hover.and_then(|id| self.tray_at(id)).map(|i| i.tip).filter(|t| !t.trim().is_empty());
-        if (matches!(self.hover, Some(BATT) | Some(STATUS)) || tray_tip.is_some()) && self.open.is_none() {
-            let label = match tray_tip {
-                Some(t) => t.lines().next().unwrap_or("").to_string(),
-                None => match Self::battery_label() {
-                    Some(l) => l,
-                    None => return,
-                },
+        let corner = self.corner.is_some();
+        let status_tip = match self.hover {
+            Some(BATT) => Self::battery_label(),
+            Some(VOL) if corner => {
+                let v = nacre_platform::audio::latest();
+                Some(if v.muted { "Volume: mute".to_string() } else { format!("Volume: {}%", (v.level * 100.0).round() as i32) })
+            }
+            Some(WIFI) if corner => Some(match self.wifi {
+                Some(true) => format!("Wi-Fi: {}", nacre_platform::wifi::ssid().unwrap_or_else(|| "terhubung".into())),
+                _ => "Wi-Fi: tidak terhubung".to_string(),
+            }),
+            _ => None,
+        };
+        if (status_tip.is_some() || tray_tip.is_some()) && self.open.is_none() {
+            let label = match tray_tip.map(|t| t.lines().next().unwrap_or("").to_string()).or(status_tip) {
+                Some(l) => l,
+                None => return,
             };
             let at = self.hover.unwrap_or(BATT);
             if self.tip.is_none() {
@@ -737,7 +753,34 @@ impl Bar {
         }
     }
 
+    /// Monitor eksternal dicolok/dicabut: ukuran layar berubah, posisi kapsul harus dihitung ulang.
+    fn check_screen(&mut self) {
+        let s = sys::screen_size();
+        let dpi = unsafe { GetDpiForWindow(self.popup.hwnd) }.max(96) as f32 / 96.0 * prefs::ui_scale();
+        if s == self.screen && (dpi - self.dpi).abs() < 0.01 {
+            return;
+        }
+        nacre_platform::log::line("menubar", &format!("layar berubah {:?} -> {:?} dpi {}", self.screen, s, dpi));
+        self.screen = s;
+        self.dpi = dpi;
+        self.cache.clear();
+        self.close_menu();
+        self.close_flyout();
+        self.corner = None;
+        self.h = 0;
+        self.relayout();
+        if ah_on() && self.ah_shown {
+            self.conceal();
+        }
+        self.render();
+    }
+
     fn autohide_tick(&mut self) {
+        self.check_screen();
+        if self.corner.is_some() && rail_metrics(self.dpi).0 != self.h {
+            self.relayout();
+            self.render();
+        }
         if !ah_on() {
             return;
         }
@@ -767,6 +810,22 @@ impl Bar {
                 }
                 pid == std::process::id() && pt.x > self.screen.0 / 2
             };
+            // Panel tray ikut tertutup sendiri bila kursor meninggalkannya (kecuali menu klik kanan aplikasi masih terbuka).
+            if self.flyout_open() {
+                let r = self.flyout.as_ref().map(|p| p.rect).unwrap_or((0, 0, 0, 0));
+                let m = pad;
+                let inside = pt.x >= r.0 - m && pt.x < r.0 + r.2 + m && pt.y >= r.1 - m && pt.y < r.1 + r.3 + m;
+                if inside || near || ours || context_menu_open() {
+                    self.fly_out = 0;
+                } else {
+                    self.fly_out += 1;
+                    if self.fly_out >= 12 {
+                        self.fly_out = 0;
+                        self.close_flyout();
+                        self.render();
+                    }
+                }
+            }
             if near || ours || self.open.is_some() || self.flyout_open() || shell_flyout_fg() {
                 self.ah_out = 0;
             } else {
@@ -898,7 +957,17 @@ impl Bar {
             // Seperti pojok taskbar Windows 11: [^] [wifi speaker baterai] [jam/tanggal].
             let (tm, dt) = self.clock_lines();
             let cw = self.small_w(&tm, 12.0, BAR_W).max(self.small_w(&dt, 12.0, BAR_W)) + 2.0 * pad;
-            let mut right = vec![LItem { id: CLOCK, width: cw }, LItem { id: STATUS, width: self.status_w() }];
+            let mut right = vec![LItem { id: CLOCK, width: cw }];
+            // Ikon status terpisah supaya hover-nya sendiri-sendiri; kliknya tetap membuka Quick Settings.
+            if let Some(bw) = self.batt_w() {
+                right.push(LItem { id: BATT, width: bw + 8.0 * d });
+            }
+            if nacre_platform::audio::latest().available {
+                right.push(LItem { id: VOL, width: 30.0 * d });
+            }
+            if self.wifi.is_some() {
+                right.push(LItem { id: WIFI, width: 30.0 * d });
+            }
             if !self.tray.is_empty() {
                 right.push(LItem { id: TRAY_BTN, width: 28.0 * d });
             }
@@ -906,8 +975,7 @@ impl Bar {
             let (l, r) = lay::layout(pill_w, 6.0 * d, &[], &right, None);
             self.left = l;
             self.right = r;
-            let h = (40.0 * d).round() as i32;
-            let m = (8.0 * d).round() as i32;
+            let (h, m) = rail_metrics(d);
             let w = pill_w.ceil() as i32;
             let (x, y) = (self.screen.0 - w - m, self.screen.1 - h - m);
             if self.corner != Some((x, y, w)) || self.h != h {
@@ -1333,6 +1401,11 @@ impl Bar {
                         self.draw_battery(p.x, p.w)
                     }
                 }
+                VOL => {
+                    let v = nacre_platform::audio::latest();
+                    let g = if v.muted || v.level <= 0.0 { "\u{E74F}" } else if v.level < 0.34 { "\u{E993}" } else if v.level < 0.67 { "\u{E994}" } else { "\u{E995}" };
+                    self.draw_glyph(g, cx, 15.0, 0.95);
+                }
                 TRAY_BTN => self.draw_glyph(if self.flyout_open() { "\u{E70D}" } else { "\u{E70E}" }, cx, 11.0, 0.95),
                 n if n >= TRAY0 && n < TRAY0 + TRAY_MAX as u32 => self.draw_tray((n - TRAY0) as usize, cx),
                 _ => {}
@@ -1719,6 +1792,11 @@ impl Bar {
     }
 
     fn click(&mut self, id: u32) {
+        if self.corner.is_some() && matches!(id, WIFI | BATT | VOL) {
+            self.close_menu();
+            keys::chord(&[keys::WIN, 0x41]);
+            return;
+        }
         if id == TRAY_BTN {
             self.close_menu();
             if self.flyout_open() {
@@ -1764,7 +1842,7 @@ impl Bar {
                 }
             }
             // Menu asli Windows: Quick Settings (Win+A).
-            STATUS => {
+            STATUS | VOL => {
                 self.close_menu();
                 keys::chord(&[keys::WIN, 0x41]);
             }
@@ -2083,6 +2161,19 @@ fn appbar_async(hwnd: isize, screen_w: i32, h: i32) {
 /// Auto-hide aktif: diminta pengguna, atau Rail sedang di pojok kanan bawah.
 unsafe extern "system" fn flyout_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        // Menu klik kanan aplikasi tray harus tampil di depan panel tray, bukan di belakangnya.
+        WM_TIMER if wp.0 == T_LIFT => {
+            let left = with_bar(|b| {
+                b.menu_lift = b.menu_lift.saturating_sub(1);
+                b.menu_lift
+            })
+            .unwrap_or(0);
+            lift_context_menus();
+            if left == 0 && !context_menu_open() {
+                let _ = KillTimer(Some(hwnd), T_LIFT);
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONUP | WM_RBUTTONUP => {
             let (x, y) = xy(lp);
             let right = msg == WM_RBUTTONUP;
@@ -2090,8 +2181,16 @@ unsafe extern "system" fn flyout_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 if let Some((icon, _, _)) = b.flyout_hit(x, y) {
                     let mut pt = windows::Win32::Foundation::POINT::default();
                     let _ = GetCursorPos(&mut pt);
-                    b.close_flyout();
-                    b.render();
+                    if right {
+                        b.menu_lift = 70;
+                        let _ = SetTimer(Some(hwnd), T_LIFT, 30, None);
+                        if let Some(t) = b.tip.as_ref() {
+                            t.hide();
+                        }
+                    } else {
+                        b.close_flyout();
+                        b.render();
+                    }
                     crate::tray::invoke(&icon, if right { crate::tray::Button::Right } else { crate::tray::Button::Left }, pt.x, pt.y);
                 }
             });
@@ -2123,6 +2222,37 @@ unsafe extern "system" fn flyout_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 }
 
 /// Quick Settings / kalender Windows sedang terbuka: jangan sembunyikan kapsul.
+/// Menu klik kanan (kelas #32768) dari aplikasi tray sedang tampil.
+fn lift_context_menus() {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    unsafe {
+        let mut after: Option<HWND> = None;
+        for _ in 0..8 {
+            let Ok(h) = FindWindowExW(None, after, w!("#32768"), None) else { break };
+            if h.0.is_null() {
+                break;
+            }
+            if IsWindowVisible(h).as_bool() {
+                let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            after = Some(h);
+        }
+    }
+}
+
+fn context_menu_open() -> bool {
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::FindWindowW(w!("#32768"), None)
+            .map(|h| !h.0.is_null() && windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h).as_bool())
+            .unwrap_or(false)
+    }
+}
+
+/// Tinggi dan jarak bawah kapsul.
+fn rail_metrics(d: f32) -> (i32, i32) {
+    ((40.0 * d).round() as i32, (8.0 * d).round() as i32)
+}
+
 fn shell_flyout_fg() -> bool {
     unsafe {
         let w = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
